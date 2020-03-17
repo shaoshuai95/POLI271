@@ -1,0 +1,238 @@
+---
+title: "PISA Test"
+author: "Shuai Shao"
+date: "3/15/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+theme_set(theme_bw())
+library("sf")
+library("rnaturalearth")
+library("rnaturalearthdata")
+library("rgeos")
+library(ggthemes)
+library(maps)
+library(foreign)
+library(MASS)
+library(Zelig)
+```
+
+Section 1. Descriptive map
+```{r Section 1}
+#Map PISA score 2018
+world <- ne_countries(scale="medium",returnclass="sf")
+class(world)
+world_map <- map_data("world")
+#Import data
+PISAcountry <- read.csv("PISAcountry.csv")
+
+#Draw the map
+image <- PISAcountry %>%
+    ggplot(aes(map_id = `country`)) +
+    geom_map(aes(fill = `average.score`), map = world_map, palette="RdBu") +
+    expand_limits(x = world_map$long, y = world_map$lat) +
+    labs(title = "PISA Test Average Total Scores, 2018",
+         subtitle = "data sources: OECD") +
+    theme_map() +
+    scale_fill_distiller(palette ="PuBu", direction = 1)+
+    coord_map(projection = "mollweide", xlim = c(-180, 180))+
+    labs(fill = "average score")
+
+print(image)
+```
+
+Model 1. Linear Regression: cognitive abilities predict reading socres
+```{r Model 1}
+#Import data
+usa = read.csv("USA_student.csv")
+
+#Write a function for linear regression
+ll.normal <- function(par,y,X){
+ beta <- par[1:ncol(X)]
+ sigma2 <- exp(par[ncol(X)+1])
+ -1/2 * (sum(log(sigma2) + (y -(X%*%beta))^2/sigma2))
+}
+
+#Create the X matrix with an intercept
+covariates <- as.matrix(cbind(1,usa$Understand,usa$Info,usa$EvaRef,usa$SingleTS,usa$MultipleTS))
+#Create the Y matrix
+depvar <- usa$read 
+
+#Optimize the model
+reading <- optim(par = rep(0, ncol(covariates) + 1), fn = ll.normal,
+                 y = depvar, X = covariates, control = list(fnscale = -1),
+                 method = "BFGS", hessian = TRUE)
+#Calculate the standard deviation
+std <- sqrt(diag(solve(-reading$hessian)))
+```
+
+Model 2. Logit
+```{r model 2}
+#Create a dataframe for model 2
+exp <- usa[,c("ST011Q01TA",
+              "ST011Q02TA",
+              "ST011Q03TA",
+              "ST011Q04TA",
+              "ST011Q06TA",
+              "ST225Q04HA",
+              "ST225Q05HA",
+              "ST225Q06HA")]
+
+#Rename variables
+names(exp) <- c("desk","room","quiet","computer","Internet","level4","level5","level6")
+exp<-na.omit(exp)
+
+#Clean the dataset
+exp$desk[exp$desk==2]<-"0"
+exp$room[exp$room==2]<-"0"
+exp$quiet[exp$quiet==2]<-"0"
+exp$computer[exp$computer==2]<-"0"
+exp$Internet[exp$Internet==2]<-"0"
+
+exp$desk=as.numeric(exp$desk)
+exp$room=as.numeric(exp$room)
+exp$quiet=as.numeric(exp$quiet)
+exp$computer=as.numeric(exp$computer)
+exp$Internet=as.numeric(exp$Internet)
+
+exp <- exp %>%
+  filter(desk<=1) %>%
+  filter(room<=1) %>%
+  filter(quiet<=1) %>%
+  filter(computer<=1) %>%
+  filter(Internet<=1) 
+
+exp$post<-exp$level4+exp$level5+exp$level6
+
+#Recode total scores
+exp$y<-ifelse(exp$post>0,1,0)
+
+#Create X matrix and Y
+X <- cbind(1,exp[,c("desk","room","quiet","computer","Internet")])
+y <- exp$y
+yX <- cbind(y,X)
+y <- yX[,1]
+X <- as.matrix(yX[,-1])
+
+#Write a function for Logit Likelihood
+logit.ll <- function(param,X,y){
+  cov <- X%*%param
+  -sum(log(1+exp((1-2*y)*cov)))
+}
+
+#Model 2 MLE
+model2 <- optim(par=rep(0,6),
+                y=y,
+                X=X,
+                fn=logit.ll,
+                method="BFGS",
+                control=list(fnscale=-1),
+                hessian=TRUE)
+model2.se <- sqrt(diag(solve(-model2$hessian)))
+
+#Check my work with GLM
+summary(glm(y~desk+room+quiet+computer+Internet,family=binomial(link="logit"),data=exp))
+```
+
+```{r model 2 predicted values}
+set.seed(92093)
+#Predicted values with energy speech
+setx <-apply(X,2,mean)
+#With no Internet access
+setx["Internet"]<-0
+simpar <- mvrnorm(10000,model2$par,-solve(model2$hessian))
+pr = 1/(1+exp(-simpar%*%setx))
+mean(rbinom(10000,1,pr))
+#With Internet access
+setx["Internet"]<-1
+simpar1 <- mvrnorm(10000,model2$par,-solve(model2$hessian))
+pr1 = 1/(1+exp(-simpar%*%setx))
+mean(rbinom(10000,1,pr1))
+```
+
+Model 3. Ordered Probit
+```{r model 3}
+#Create a dataframe for model 3
+evaluation <- usa[,c("ST161Q01HA",
+                     "ST161Q02HA",
+                     "ST161Q03HA",
+                     "ST161Q06HA",
+                     "ST161Q07HA",
+                     "ST161Q08HA",
+                     "ST163Q03HA")]
+
+#Rename variables
+names(evaluation) <- c("Good Reader",
+                       "Understanding",
+                       "Fluency",
+                       "Difficulty-Text",
+                       "Repeat",
+                       "Difficulty-Question",
+                       "Evaluation")
+
+#Filter out incorrect values
+evaluation <- evaluation %>%
+  filter(`Good Reader`<5) %>%
+  filter(`Understanding`<5) %>%
+  filter(`Fluency`<5) %>%
+  filter(`Difficulty-Text`<5) %>%
+  filter(`Difficulty-Question`<5) %>%
+  filter(`Repeat`<5) %>%
+  filter(`Evaluation`<5)
+
+y3 <- evaluation$Evaluation
+y0 <- sort(unique(y3))
+
+##Make a matrix nrows = # observations, ncols = # categories
+##with 1's or 0's if that observation is in that category
+m=4
+Z <- matrix(NA, nrow(evaluation),m)
+for (j in 1:m)
+	Z[,j] <- y3==y0[j]
+X3 <- as.matrix(evaluation[,c("Good Reader",
+                              "Understanding",
+                              "Fluency",
+                              "Difficulty-Text",
+                              "Repeat",
+                              "Difficulty-Question")])
+
+#Write a function for Ordered Probit
+ll.oprobit <- function(par,Z,X){
+	beta <- par[1:ncol(X)]
+	tau <- par[(ncol(X)+1):length(par)]
+	ystarmu <- X%*%beta
+	m <- length(tau) + 1
+	probs=cprobs=matrix(nrow=length(ystarmu), ncol=m)
+	for (j in 1:(m-1))
+		cprobs[,j] <- pnorm(tau[j]- ystarmu)
+	probs[,m] <- 1-cprobs[,m-1]
+	probs[,1] <- cprobs[,1]
+	for (j in 2:(m-1))
+		probs[,j] <- cprobs[,j] - cprobs[,(j-1)]
+	sum(log(probs[Z]))
+}
+
+#Optimize the model
+par.model3 <- c(rep(1,6),0,1,2)
+model3 <- optim(par.model3,
+                ll.oprobit,
+                Z=Z,X=X3,
+                method="BFGS",
+                control=list(fnscale=-1))
+
+#Zelig
+evaluation$Evaluation <- as.factor(evaluation$Evaluation)
+z.out <- zelig(Evaluation~`Good Reader`+`Understanding`+`Difficulty-Text`+`Fluency`+`Repeat`+`Difficulty-Question`,model="oprobit",data=evaluation)
+summary(z.out)
+
+#If Understanding Ability is High/Low
+x.low <- setx(z.out, Understanding = 0) 
+x.high <- setx(z.out, Understanding = 4)
+s.out <- sim(z.out, x = x.low, x1 = x.high)
+plot(s.out)
+```
+
